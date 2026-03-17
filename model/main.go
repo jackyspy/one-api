@@ -3,6 +3,11 @@ package model
 import (
 	"database/sql"
 	"fmt"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/glebarez/sqlite"
 	"github.com/songquanpeng/one-api/common"
 	"github.com/songquanpeng/one-api/common/config"
 	"github.com/songquanpeng/one-api/common/env"
@@ -11,11 +16,7 @@ import (
 	"github.com/songquanpeng/one-api/common/random"
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
-	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
-	"os"
-	"strings"
-	"time"
 )
 
 var DB *gorm.DB
@@ -71,11 +72,14 @@ func chooseDB(envName string) (*gorm.DB, error) {
 	case strings.HasPrefix(dsn, "postgres://"):
 		// Use PostgreSQL
 		return openPostgreSQL(dsn)
+	case strings.HasPrefix(dsn, "sqlite:"):
+		// Use SQLite with custom DSN (e.g., sqlite::memory: or sqlite:/path/to/db)
+		return openSQLiteWithDSN(dsn)
 	case dsn != "":
 		// Use MySQL
 		return openMySQL(dsn)
 	default:
-		// Use SQLite
+		// Use SQLite with default path
 		return openSQLite()
 	}
 }
@@ -103,6 +107,25 @@ func openSQLite() (*gorm.DB, error) {
 	logger.SysLog("SQL_DSN not set, using SQLite as database")
 	common.UsingSQLite = true
 	dsn := fmt.Sprintf("%s?_busy_timeout=%d", common.SQLitePath, common.SQLiteBusyTimeout)
+	return gorm.Open(sqlite.Open(dsn), &gorm.Config{
+		PrepareStmt: true, // precompile SQL
+	})
+}
+
+func openSQLiteWithDSN(dsn string) (*gorm.DB, error) {
+	logger.SysLog("using SQLite as database with custom DSN")
+	common.UsingSQLite = true
+	// Handle sqlite: prefix
+	// sqlite::memory: -> :memory:
+	// sqlite:/path/to/db -> /path/to/db
+	dsn = strings.TrimPrefix(dsn, "sqlite:")
+	if dsn == "" {
+		dsn = ":memory:"
+	}
+	// Add busy timeout if not a memory database
+	if dsn != ":memory:" && !strings.Contains(dsn, "?") {
+		dsn = fmt.Sprintf("%s?_busy_timeout=%d", dsn, common.SQLiteBusyTimeout)
+	}
 	return gorm.Open(sqlite.Open(dsn), &gorm.Config{
 		PrepareStmt: true, // precompile SQL
 	})
