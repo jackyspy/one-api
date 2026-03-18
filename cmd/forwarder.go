@@ -84,6 +84,11 @@ func init() {
 	viper.BindEnv("batch-update", "BATCH_UPDATE_ENABLED")
 	viper.BindEnv("batch-update-interval", "BATCH_UPDATE_INTERVAL")
 	viper.BindEnv("gin-mode", "GIN_MODE")
+
+    // TLS env bindings
+    viper.BindEnv("nats-tls", "NATS_TLS")
+    viper.BindEnv("nats-tls-skip-verify", "NATS_TLS_SKIP_VERIFY")
+    viper.BindEnv("nats-tls-ca-cert", "NATS_TLS_CA_CERT")
 }
 
 func runForwarder(cmd *cobra.Command, args []string) {

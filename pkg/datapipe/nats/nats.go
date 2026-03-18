@@ -3,12 +3,15 @@ package nats
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -54,7 +57,6 @@ type NatsPipe struct {
 	config       map[string]string
 	maxBodyBytes int64
 }
-
 // NatsTransport implements http.RoundTripper interface
 type NatsTransport struct {
 	nc            *nats.Conn
@@ -67,22 +69,18 @@ type cancelReadCloser struct {
 	rc     io.ReadCloser
 	cancel context.CancelFunc
 }
-
 func (c *cancelReadCloser) Read(p []byte) (n int, err error) { return c.rc.Read(p) }
 func (c *cancelReadCloser) Close() error {
 	c.cancel()
 	return c.rc.Close()
 }
-
 func init() {
 	datapipe.Register(&NatsPipe{})
 }
-
 // Name returns the identifier for this DataPipe
 func (p *NatsPipe) Name() string {
 	return "nats"
 }
-
 // Init establishes NATS connection using the provided config
 func (p *NatsPipe) Init(config map[string]string) error {
 	p.config = config
@@ -100,9 +98,10 @@ func (p *NatsPipe) Init(config map[string]string) error {
 		return fmt.Errorf("nats_url is required in config")
 	}
 
-	nc, err := nats.Connect(natsURL,
+	// Build NATS options
+	opts := []nats.Option{
 		nats.Timeout(DefaultTimeout),
-		nats.ReconnectWait(2*time.Second),
+		nats.ReconnectWait(2 * time.Second),
 		nats.MaxReconnects(5),
 		nats.DisconnectErrHandler(func(nc *nats.Conn, err error) {
 			fmt.Printf("[NatsPipe] Disconnected from NATS: %v\n", err)
@@ -110,7 +109,34 @@ func (p *NatsPipe) Init(config map[string]string) error {
 		nats.ReconnectHandler(func(nc *nats.Conn) {
 			fmt.Printf("[NatsPipe] Reconnected to NATS at %s\n", nc.ConnectedUrl())
 		}),
-	)
+	}
+
+	// Handle TLS configuration
+	if config["nats_tls"] == "true" || config["nats_tls"] == "1" {
+		tlsConfig := &tls.Config{}
+
+		// Skip TLS verification (for testing)
+		if config["nats_tls_skip_verify"] == "true" || config["nats_tls_skip_verify"] == "1" {
+			tlsConfig.InsecureSkipVerify = true
+		}
+
+		// Load CA certificate if provided
+		if caCert, ok := config["nats_tls_ca_cert"]; ok && caCert != "" {
+			caData, err := os.ReadFile(caCert)
+			if err != nil {
+				return fmt.Errorf("failed to read CA certificate: %w", err)
+			}
+			certPool := x509.NewCertPool()
+			if !certPool.AppendCertsFromPEM(caData) {
+				return fmt.Errorf("failed to parse CA certificate")
+			}
+			tlsConfig.RootCAs = certPool
+		}
+
+		opts = append(opts, nats.SecureTLS(tlsConfig))
+	}
+
+	nc, err := nats.Connect(natsURL, opts...)
 	if err != nil {
 		return fmt.Errorf("failed to connect to NATS: %w", err)
 	}
@@ -118,7 +144,6 @@ func (p *NatsPipe) Init(config map[string]string) error {
 	p.nc = nc
 	return nil
 }
-
 // GetTransport returns the custom HTTP transport
 func (p *NatsPipe) GetTransport() http.RoundTripper {
 	return &NatsTransport{
@@ -128,7 +153,6 @@ func (p *NatsPipe) GetTransport() http.RoundTripper {
 		maxBodyBytes:  p.maxBodyBytes,
 	}
 }
-
 // Listen starts listening for requests and forwards them to the internal relay server.
 // This method blocks and should be run in a goroutine or as the main loop.
 // The targetBaseURL parameter is ignored; internal_url from config is used instead.
@@ -163,11 +187,9 @@ func (p *NatsPipe) Listen(targetBaseURL string) error {
 	}
 
 	fmt.Printf("[NatsPipe] Successfully subscribed to %s, waiting for requests...\n", subject)
-
 	// Block forever (or until connection is closed)
 	select {}
 }
-
 // handleRequestToInternalRelay processes an incoming NATS request and forwards it to the internal relay server.
 // This preserves the original request path and lets the internal relay handle routing based on model.
 func (p *NatsPipe) handleRequestToInternalRelay(msg *nats.Msg, internalURL string) {
@@ -176,53 +198,45 @@ func (p *NatsPipe) handleRequestToInternalRelay(msg *nats.Msg, internalURL strin
 		fmt.Println("[NatsPipe] Warning: received request with no reply subject, skipping")
 		return
 	}
-
 	// Deserialize the request
 	var reqMsg RequestMessage
 	if err := json.Unmarshal(msg.Data, &reqMsg); err != nil {
 		p.sendError(replySubject, fmt.Sprintf("failed to unmarshal request: %v", err))
 		return
 	}
-
 	// Parse the original URL to extract path and query
 	parsedURL, err := url.Parse(reqMsg.URL)
 	if err != nil {
 		p.sendError(replySubject, fmt.Sprintf("failed to parse request URL: %v", err))
 		return
 	}
-
 	// Build target URL: internal relay base + original path + query
 	targetURL := internalURL + parsedURL.Path
 	if parsedURL.RawQuery != "" {
 		targetURL += "?" + parsedURL.RawQuery
 	}
-
 	var body io.Reader
 	if reqMsg.Body != "" {
 		bodyBytes, err := base64.StdEncoding.DecodeString(reqMsg.Body)
 		if err != nil {
-			p.sendError(replySubject, fmt.Sprintf("failed to decode body: %v", err))
-			return
+		p.sendError(replySubject, fmt.Sprintf("failed to decode body: %v", err))
+		return
 		}
 		body = bytes.NewReader(bodyBytes)
 	}
-
 	httpReq, err := http.NewRequest(reqMsg.Method, targetURL, body)
 	if err != nil {
 		p.sendError(replySubject, fmt.Sprintf("failed to create request: %v", err))
 		return
 	}
-
 	// Restore headers
 	for key, values := range reqMsg.Headers {
 		for _, value := range values {
 			httpReq.Header.Add(key, value)
 		}
 	}
-
 	// Create HTTP client with extended timeout for streaming
 	client := &http.Client{Timeout: DefaultReadTimeout}
-
 	// Execute the request to internal relay
 	resp, err := client.Do(httpReq)
 	if err != nil {
@@ -230,7 +244,6 @@ func (p *NatsPipe) handleRequestToInternalRelay(msg *nats.Msg, internalURL strin
 		return
 	}
 	defer resp.Body.Close()
-
 	// Send header message first
 	headerMsg := ResponseMessage{
 		Type:       MsgTypeHeader,
@@ -245,7 +258,6 @@ func (p *NatsPipe) handleRequestToInternalRelay(msg *nats.Msg, internalURL strin
 		fmt.Printf("[NatsPipe] Failed to send header: %v\n", err)
 		return
 	}
-
 	// Stream the response body in chunks
 	buffer := make([]byte, DefaultChunkSize)
 	for {
@@ -269,7 +281,6 @@ func (p *NatsPipe) handleRequestToInternalRelay(msg *nats.Msg, internalURL strin
 			break
 		}
 	}
-
 	// Send EOF message
 	eofMsg := ResponseMessage{Type: MsgTypeEOF}
 	eofData, _ := json.Marshal(eofMsg)
@@ -277,7 +288,6 @@ func (p *NatsPipe) handleRequestToInternalRelay(msg *nats.Msg, internalURL strin
 		fmt.Printf("[NatsPipe] Failed to send EOF: %v\n", err)
 	}
 }
-
 // sendError sends an error response back to the caller
 func (p *NatsPipe) sendError(replySubject, errMsg string) {
 	fmt.Printf("[NatsPipe] Sending error: %s\n", errMsg)
@@ -290,7 +300,6 @@ func (p *NatsPipe) sendError(replySubject, errMsg string) {
 	}
 	headerData, _ := json.Marshal(headerMsg)
 	_ = p.nc.Publish(replySubject, headerData)
-
 	// Send error as chunk
 	chunkMsg := ResponseMessage{
 		Type: MsgTypeChunk,
@@ -298,13 +307,11 @@ func (p *NatsPipe) sendError(replySubject, errMsg string) {
 	}
 	chunkData, _ := json.Marshal(chunkMsg)
 	_ = p.nc.Publish(replySubject, chunkData)
-
 	// Send EOF
 	eofMsg := ResponseMessage{Type: MsgTypeEOF}
 	eofData, _ := json.Marshal(eofMsg)
 	_ = p.nc.Publish(replySubject, eofData)
 }
-
 // RoundTrip implements http.RoundTripper interface
 func (t *NatsTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// Serialize the HTTP request
@@ -312,52 +319,43 @@ func (t *NatsTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to serialize request: %w", err)
 	}
-
 	reqData, err := json.Marshal(reqMsg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal request message: %w", err)
 	}
-
 	// Create reply inbox for receiving response
 	replyInbox := t.nc.NewRespInbox()
-
 	// For nats:// URLs, the host is the subject.
 	targetSubject := t.buildTargetSubject(req.URL.Host)
 	if targetSubject == "" {
 		return nil, fmt.Errorf("empty NATS subject")
 	}
-
 	// Subscribe to reply inbox before publishing
 	sub, err := t.nc.SubscribeSync(replyInbox)
 	if err != nil {
 		return nil, fmt.Errorf("failed to subscribe to reply inbox: %w", err)
 	}
-
 	// Publish request with reply subject
 	if err := t.nc.PublishRequest(targetSubject, replyInbox, reqData); err != nil {
 		_ = sub.Unsubscribe()
 		return nil, fmt.Errorf("failed to publish request: %w", err)
 	}
-
 	// Wait for header message (first response)
 	msg, err := sub.NextMsg(t.headerTimeout)
 	if err != nil {
 		_ = sub.Unsubscribe()
 		return nil, fmt.Errorf("timeout waiting for response header: %w", err)
 	}
-
 	// Parse header message
 	var headerMsg ResponseMessage
 	if err := json.Unmarshal(msg.Data, &headerMsg); err != nil {
 		_ = sub.Unsubscribe()
 		return nil, fmt.Errorf("failed to unmarshal header message: %w", err)
 	}
-
 	if headerMsg.Type != MsgTypeHeader {
 		_ = sub.Unsubscribe()
 		return nil, fmt.Errorf("expected header message, got: %s", headerMsg.Type)
 	}
-
 	// Build HTTP response from header
 	resp := &http.Response{
 		StatusCode: headerMsg.StatusCode,
@@ -368,17 +366,14 @@ func (t *NatsTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		Header:     make(http.Header),
 		Request:    req,
 	}
-
 	for key, values := range headerMsg.Headers {
 		for _, value := range values {
 			resp.Header.Add(key, value)
 		}
 	}
-
 	resp.Body = t.createStreamingBody(req.Context(), sub)
 	return resp, nil
 }
-
 // serializeRequest converts http.Request to RequestMessage
 func (t *NatsTransport) serializeRequest(req *http.Request) (*RequestMessage, error) {
 	msg := &RequestMessage{
@@ -386,12 +381,10 @@ func (t *NatsTransport) serializeRequest(req *http.Request) (*RequestMessage, er
 		URL:     req.URL.String(),
 		Headers: make(map[string][]string),
 	}
-
 	// Copy headers
 	for key, values := range req.Header {
 		msg.Headers[key] = values
 	}
-
 	// Read and encode body if present
 	if req.Body != nil {
 		bodyBytes, err := io.ReadAll(req.Body)
@@ -404,68 +397,57 @@ func (t *NatsTransport) serializeRequest(req *http.Request) (*RequestMessage, er
 		}
 		msg.Body = base64.StdEncoding.EncodeToString(bodyBytes)
 	}
-
 	return msg, nil
 }
-
 // buildTargetSubject constructs NATS subject from host.
 // For nats:// requests, the host is already a subject (e.g., "llm.requests").
 func (t *NatsTransport) buildTargetSubject(host string) string {
 	return strings.TrimSpace(host)
 }
-
 func (t *NatsTransport) createStreamingBody(parentCtx context.Context, sub *nats.Subscription) io.ReadCloser {
 	ctx, cancel := context.WithCancel(parentCtx)
 	pr, pw := io.Pipe()
-
 	go func() {
 		defer cancel()
 		defer sub.Unsubscribe()
 		defer pw.Close()
-
 		for {
-			select {
-			case <-ctx.Done():
-				_ = pw.CloseWithError(ctx.Err())
-				return
-			default:
-			}
-
-			msg, err := sub.NextMsg(t.chunkTimeout)
-			if err != nil {
-				if err == nats.ErrTimeout {
-					continue
-				}
-				_ = pw.CloseWithError(err)
-				return
-			}
-
-			var respMsg ResponseMessage
-			if err := json.Unmarshal(msg.Data, &respMsg); err != nil {
-				_ = pw.CloseWithError(fmt.Errorf("failed to unmarshal chunk: %w", err))
-				return
-			}
-
-			switch respMsg.Type {
-			case MsgTypeChunk:
-				data, err := base64.StdEncoding.DecodeString(respMsg.Data)
-				if err != nil {
-					_ = pw.CloseWithError(fmt.Errorf("failed to decode chunk data: %w", err))
-					return
-				}
-				if _, err := pw.Write(data); err != nil {
-					return
-				}
-
-			case MsgTypeEOF:
-				return
-
-			default:
-				_ = pw.CloseWithError(fmt.Errorf("unexpected message type: %s", respMsg.Type))
-				return
-			}
+		select {
+		case <-ctx.Done():
+			_ = pw.CloseWithError(ctx.Err())
+			return
+		default:
 		}
-	}()
-
+		msg, err := sub.NextMsg(t.chunkTimeout)
+		if err != nil {
+			if err == nats.ErrTimeout {
+				continue
+			}
+			_ = pw.CloseWithError(err)
+			return
+		}
+		var respMsg ResponseMessage
+		if err := json.Unmarshal(msg.Data, &respMsg); err != nil {
+			_ = pw.CloseWithError(fmt.Errorf("failed to unmarshal chunk: %w", err))
+			return
+		}
+		switch respMsg.Type {
+		case MsgTypeChunk:
+			data, err := base64.StdEncoding.DecodeString(respMsg.Data)
+			if err != nil {
+				_ = pw.CloseWithError(fmt.Errorf("failed to decode chunk data: %w", err))
+				return
+			}
+			if _, err := pw.Write(data); err != nil {
+				return
+			}
+		case MsgTypeEOF:
+			return
+		default:
+			_ = pw.CloseWithError(fmt.Errorf("unexpected message type: %s", respMsg.Type))
+            return
+        }
+    }
+}()
 	return &cancelReadCloser{rc: pr, cancel: cancel}
 }
